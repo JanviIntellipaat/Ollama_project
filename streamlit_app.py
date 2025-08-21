@@ -21,7 +21,7 @@ if ON_EMBED_DIM_MISMATCH not in {"suffix_collection", "reset", "error"}:
     ON_EMBED_DIM_MISMATCH = "suffix_collection"  # safety fallback
 
 st.set_page_config(page_title="Ollama_AI_Janvi — RAG", layout="wide")
-st.title("🧠 Ollama_AI_Janvi — RAG Console")
+st.title("🧠 Deutsche Börse — RAG Console")
 
 @st.cache_resource(show_spinner=False)
 def get_rag():
