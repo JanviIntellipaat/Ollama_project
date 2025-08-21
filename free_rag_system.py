@@ -319,3 +319,26 @@ class FreeRAGSystem:
         stats = self.vector_db.get_database_stats()
         sstats = self.structured_store.get_stats()
         return {"vector_db": stats, "structured_store": sstats}
+
+    # -------- Delete operations --------
+    def delete_unstructured_document(self, document_id: str) -> bool:
+        """
+        Delete a document (all its chunks) from the local vector store by document_id.
+        Returns True if anything was deleted.
+        """
+        try:
+            return self.vector_db.delete_document(document_id)
+        except Exception as e:
+            logger.error(f"Vector delete failed: {e}")
+            return False
+
+    def delete_structured_file(self, file_id: int) -> bool:
+        """
+        Delete a structured artifact by file_id (drops materialized tables and metadata).
+        Returns True if a row was deleted.
+        """
+        try:
+            return self.structured_store.delete_file(int(file_id))
+        except Exception as e:
+            logger.error(f"Structured delete failed: {e}")
+            return False
