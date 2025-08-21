@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ========= Corp proxy (adjust if needed) =========
+# ========= Proxy (override if needed) =========
+# Use your existing env if set; otherwise fall back to the DB proxy.
 export HTTP_PROXY="${HTTP_PROXY:-http://webproxy.deutsche-boerse.de:8080}"
 export HTTPS_PROXY="${HTTPS_PROXY:-$HTTP_PROXY}"
 export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
@@ -9,10 +10,19 @@ export http_proxy="$HTTP_PROXY"
 export https_proxy="$HTTPS_PROXY"
 export no_proxy="$NO_PROXY"
 
-# ========= Ollama: user-owned daemon on 11435 =========
+# ========= User-scoped Ollama paths =========
+# Keep models in your home to avoid permission clashes with other users
+export OLLAMA_MODELS="${OLLAMA_MODELS:-$HOME/.ollama/models}"
+mkdir -p "$OLLAMA_MODELS" 2>/dev/null || true
+
+# Logs in your user cache dir (fixes /tmp permission issues across users)
+LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ollama"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+LOG="$LOG_DIR/ollama_${USER}_11435.log"
+
+# ========= Ollama server (user-owned) =========
 export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11435}"
 export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://127.0.0.1:11435/api}"
-LOG="/tmp/ollama_user_11435.log"
 
 # ========= Streamlit bind (tunnel-friendly) =========
 STREAMLIT_ADDRESS="${STREAMLIT_ADDRESS:-127.0.0.1}"
@@ -25,6 +35,8 @@ need_cmd streamlit
 
 echo "👉 Proxy: $HTTP_PROXY"
 echo "👉 Ollama: $OLLAMA_HOST  (API: $OLLAMA_BASE_URL)"
+echo "👉 Models dir: $OLLAMA_MODELS"
+echo "👉 Log: $LOG"
 echo "👉 Streamlit: $STREAMLIT_ADDRESS:$STREAMLIT_PORT"
 
 wait_for_api() {
@@ -38,43 +50,51 @@ wait_for_api() {
 
 start_daemon_if_needed() {
   if curl -sf "$OLLAMA_BASE_URL/tags" >/dev/null; then
-    echo "✅ Ollama daemon responding on $OLLAMA_HOST"
+    echo "✅ Ollama daemon already responding on $OLLAMA_HOST"
     return 0
   fi
+
   echo "▶️ Starting user ollama daemon on $OLLAMA_HOST ..."
+  # Important: nohup writes to a user-writable log file
   nohup ollama serve >"$LOG" 2>&1 &
   sleep 2
+
   if wait_for_api; then
     echo "✅ Ollama API up on $OLLAMA_HOST"
   else
     echo "❌ Ollama failed to start on $OLLAMA_HOST"
-    tail -n 80 "$LOG" || true
+    echo "── Log tail ─────────────────────────────────────────"
+    tail -n 120 "$LOG" || true
+    echo "────────────────────────────────────────────────────"
     exit 1
   fi
 }
 
 ensure_model() {
   local model="$1"
+  # Query the daemon for installed models
   if curl -sf "$OLLAMA_BASE_URL/tags" | grep -q "\"$model\""; then
     echo "✅ Model present: $model"
   else
     echo "⬇️ Pulling model: $model"
     if ! ollama pull "$model"; then
       echo "❌ Failed to pull model: $model"
-      tail -n 80 "$LOG" || true
+      echo "── Log tail ─────────────────────────────────────────"
+      tail -n 120 "$LOG" || true
+      echo "────────────────────────────────────────────────────"
       exit 1
     fi
   fi
 }
 
-# 1) Start Ollama (proxy-aware)
+# 1) Start Ollama (user-owned, proxy-aware)
 start_daemon_if_needed
 
 # 2) Ensure required models
 ensure_model "nomic-embed-text"
 ensure_model "mistral"
 
-# 3) Pick Streamlit app file
+# 3) Choose app file
 APP="streamlit_app.py"
 [[ -f "streamlit_app_fixed.py" ]] && APP="streamlit_app_fixed.py"
 
