@@ -1,36 +1,52 @@
-
 import os
 import time
+from pathlib import Path
 import streamlit as st
 
 # Prefer fixed modules if present
 try:
-    from free_rag_system_fixed import FreeRAGSystem
-except Exception:
-    from free_rag_system import FreeRAGSystem
+    from free_rag_system import FreeRAGSystem  # you just replaced this file
+except Exception as e:
+    st.error(f"Failed to import FreeRAGSystem: {e}")
+    raise
 
-# ---------------- Config ----------------
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/api")
-OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
-OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "mistral")
-VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", "./free_local_vectors")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "free_documents")
+# ---------------- Config (override via env if you like) ----------------
+OLLAMA_BASE_URL        = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11435/api")
+OLLAMA_CHAT_MODEL      = os.getenv("OLLAMA_CHAT_MODEL", "mistral")
+OLLAMA_EMBED_MODEL     = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")  # optional
+VECTOR_DB_PATH         = os.getenv("VECTOR_DB_PATH", "./free_local_vectors")
+COLLECTION_NAME        = os.getenv("COLLECTION_NAME", "free_documents")
+ON_EMBED_DIM_MISMATCH  = os.getenv("ON_EMBED_DIM_MISMATCH", "suffix_collection").lower()
+if ON_EMBED_DIM_MISMATCH not in {"suffix_collection", "reset", "error"}:
+    ON_EMBED_DIM_MISMATCH = "suffix_collection"  # safety fallback
 
-# Create a singleton RAG system
+st.set_page_config(page_title="Ollama_AI_Janvi — RAG", layout="wide")
+st.title("🧠 Ollama_AI_Janvi — RAG Console")
+
 @st.cache_resource(show_spinner=False)
 def get_rag():
+    # Pass embed model + policy (free_rag_system.py will handle dim mismatches safely)
     return FreeRAGSystem(
         db_path=VECTOR_DB_PATH,
         collection_name=COLLECTION_NAME,
         ollama_base_url=OLLAMA_BASE_URL,
-        ollama_embed_model=OLLAMA_EMBED_MODEL,
         ollama_chat_model=OLLAMA_CHAT_MODEL,
+        ollama_embed_model=OLLAMA_EMBED_MODEL,                 # now supported
+        on_embed_dim_mismatch=ON_EMBED_DIM_MISMATCH,           # 'suffix_collection' | 'reset' | 'error'
+        structured_db_path="./structured_store.duckdb",
     )
 
 rag = get_rag()
 
-st.set_page_config(page_title="Ollama_AI_Janvi — RAG", layout="wide")
-st.title("🧠 Ollama_AI_Janvi — RAG Console")
+# Small status box
+with st.sidebar:
+    st.markdown("### Runtime")
+    st.write(f"**Chat model:** {OLLAMA_CHAT_MODEL}")
+    st.write(f"**Embed model:** {OLLAMA_EMBED_MODEL}")
+    st.write(f"**Vector DB path:** {VECTOR_DB_PATH}")
+    st.write(f"**Collection:** {rag.collection_name}")
+    st.write(f"**Dim policy:** {ON_EMBED_DIM_MISMATCH}")
+    st.caption(f"Ollama API: {OLLAMA_BASE_URL}")
 
 tabs = st.tabs(["🔎 Query", "📥 Ingest", "🗑️ Manage / Delete", "📊 Stats"])
 
@@ -50,15 +66,20 @@ with tabs[0]:
                     st.write(answer)
                     with st.expander("Show retrieved context"):
                         for i, c in enumerate(ctxs):
-                            st.markdown(f"**{i+1}.** {c.get('metadata', {}).get('filename','(unknown)')} — section: {c.get('metadata', {}).get('section_heading','')}")
-                            st.caption(c.get("text","")[:800])
+                            meta = c.get('metadata', {}) or {}
+                            fname = meta.get('filename', '(unknown)')
+                            section = meta.get('section_heading', '')
+                            st.markdown(f"**{i+1}.** {fname} — {section}")
+                            st.caption((c.get('text','') or '')[:800])
                 except Exception as e:
                     st.error(f"Query failed: {e}")
 
 # ---------------- Tab: Ingest ----------------
 with tabs[1]:
     st.subheader("Ingest Files")
-    up = st.file_uploader("Upload files (PDF/DOCX/MD/TXT/CSV/XLSX/JSON/XML)", accept_multiple_files=True)
+    up = st.file_uploader(
+        "Upload files (PDF/DOCX/MD/TXT/CSV/XLSX/JSON/XML)", accept_multiple_files=True
+    )
     if up:
         for f in up:
             suffix = (f.name.split(".")[-1] or "").lower()
@@ -72,7 +93,7 @@ with tabs[1]:
                     with st.spinner(f"Ingesting unstructured: {f.name}"):
                         did = rag.ingest_unstructured(str(save_to))
                         st.success(f"Ingested (unstructured). document_id={did}")
-                elif suffix in {"csv"}:
+                elif suffix == "csv":
                     with st.spinner(f"Ingesting CSV: {f.name}"):
                         fid = rag.structured_store.ingest_csv(str(save_to))
                         st.success(f"Ingested CSV. file_id={fid}")
@@ -80,11 +101,11 @@ with tabs[1]:
                     with st.spinner(f"Ingesting Excel: {f.name}"):
                         fid = rag.structured_store.ingest_excel(str(save_to))
                         st.success(f"Ingested Excel. file_id={fid}")
-                elif suffix in {"json"}:
+                elif suffix == "json":
                     with st.spinner(f"Ingesting JSON: {f.name}"):
                         fid = rag.structured_store.ingest_json(str(save_to))
                         st.success(f"Ingested JSON. file_id={fid}")
-                elif suffix in {"xml"}:
+                elif suffix == "xml":
                     with st.spinner(f"Ingesting XML: {f.name}"):
                         fid = rag.structured_store.ingest_xml(str(save_to))
                         st.success(f"Ingested XML. file_id={fid}")
@@ -118,7 +139,6 @@ with tabs[2]:
     # --- Structured (DuckDB) deletion ---
     with col2:
         st.markdown("### Structured — Delete by file_id")
-        # List files with delete buttons
         try:
             files = rag.structured_store.list_files()
         except Exception as e:
@@ -127,8 +147,12 @@ with tabs[2]:
 
         if files:
             for rec in files:
-                with st.container(border=True):
-                    st.write(f"**file_id:** {rec.get('file_id')}  |  **filename:** {rec.get('filename')}  |  **type:** {rec.get('file_type')}")
+                with st.container():
+                    st.write(
+                        f"**file_id:** {rec.get('file_id')}  |  "
+                        f"**filename:** {rec.get('filename')}  |  "
+                        f"**type:** {rec.get('file_type')}"
+                    )
                     bcol1, bcol2 = st.columns([1,1])
                     with bcol1:
                         if st.button(f"Delete file_id {rec.get('file_id')}", key=f"del_{rec.get('file_id')}"):
