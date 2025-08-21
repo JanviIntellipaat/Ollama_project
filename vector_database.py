@@ -1,9 +1,8 @@
+
 # vector_database.py (SQLite-free local store with optional hnswlib)
-import os
 import json
 import logging
 from pathlib import Path
-from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 import requests
@@ -12,18 +11,19 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Optional ANN
+# Optional ANN (will be ignored if not installed)
 try:
-    import hnswlib  # optional; used if present and enough data
+    import hnswlib  # type: ignore
     HNSW_AVAILABLE = True
 except Exception:
     HNSW_AVAILABLE = False
+    hnswlib = None  # type: ignore
 
-# ---------- Ollama helpers ----------
+# -------- Ollama helpers --------
 def _ollama_ok(base_url: str) -> bool:
     try:
-        r = requests.get(base_url.replace("/api", ""), timeout=2)
-        return r.status_code in (200, 404)
+        r = requests.get(base_url.replace("/api", "/") + "api/tags", timeout=5)
+        return r.status_code == 200
     except Exception:
         return False
 
@@ -39,7 +39,6 @@ def _embed_with_ollama(texts: List[str], model: str, base_url: str) -> List[List
         data = resp.json()
         out.append(data["embedding"])
     return out
-# -------------------------------------
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     # a: (d,), b: (n, d) -> (n,)
@@ -51,14 +50,13 @@ class FreeVectorDatabase:
     """
     Tiny local vector store (no SQLite / no Chroma).
     Persists to disk:
-      - embeddings.npy  (float32 array, shape (N, D))
-      - docs.jsonl      (one document per line)
-      - meta.jsonl      (one metadata dict per line)
-      - ids.json        (list of ids)
-      - (optional) hnsw index: .bin + meta.json
+      - <collection>_embeddings.npy  (float32 array, shape (N, D))
+      - <collection>_docs.jsonl      (one document per line)
+      - <collection>_meta.jsonl      (one metadata dict per line)
+      - <collection>_ids.json        (list of ids)
+      - (optional) HNSW index: <collection>_hnsw.bin + <collection>_hnsw_meta.json
     Embeddings generated via Ollama (default: nomic-embed-text).
     """
-
     def __init__(
         self,
         db_path: str = "./free_local_vectors",
@@ -92,35 +90,44 @@ class FreeVectorDatabase:
         self.fp_docs = self.root / f"{collection_name}_docs.jsonl"
         self.fp_meta = self.root / f"{collection_name}_meta.jsonl"
         self.fp_ids  = self.root / f"{collection_name}_ids.json"
-
-        # hnsw index files
         self.fp_hnsw = self.root / f"{collection_name}_hnsw.bin"
-        self.fp_hmeta = self.root / f"{collection_name}_hnsw_meta.json"
+        self.fp_hmeta= self.root / f"{collection_name}_hnsw_meta.json"
 
-        # load existing
+        # memory
         self._embeddings: Optional[np.ndarray] = None
+        self._ids: List[str] = []
+        self._index = None
+        self._index_ready = False
+        self._index_dim: Optional[int] = None
+
+        self._load_all()
+
+    # ---------- Load / Save ----------
+    def _load_all(self):
         if self.fp_emb.exists():
             try:
-                self._embeddings = np.load(self.fp_emb)
-            except Exception as e:
-                logger.error(f"Could not load embeddings file: {e}")
+                self._embeddings = np.load(self.fp_emb, mmap_mode=None)
+            except Exception:
                 self._embeddings = None
-        self._ids: List[str] = []
         if self.fp_ids.exists():
             try:
-                self._ids = json.loads(self.fp_ids.read_text())
-            except Exception as e:
-                logger.error(f"Could not load ids file: {e}")
+                self._ids = json.loads(self.fp_ids.read_text(encoding="utf-8"))
+            except Exception:
                 self._ids = []
+        if HNSW_AVAILABLE and self.fp_hnsw.exists() and self.fp_hmeta.exists():
+            try:
+                meta = json.loads(self.fp_hmeta.read_text(encoding="utf-8"))
+                dim = int(meta.get("dim", 0))
+                if dim > 0 and self._embeddings is not None and self._embeddings.shape[1] == dim:
+                    index = hnswlib.Index(space="cosine", dim=dim)  # type: ignore
+                    index.load_index(str(self.fp_hnsw))
+                    index.set_ef(int(meta.get("efS", self.hnsw_efS)))
+                    self._index = index
+                    self._index_dim = dim
+                    self._index_ready = True
+            except Exception as e:
+                logger.warning(f"Failed to load HNSW index: {e}")
 
-        self._index = None
-        self._index_dim = None
-        self._index_ready = False
-        self._maybe_load_hnsw()
-
-        logger.info(f"Local vector store ready: {self.root} (count={self.count()})")
-
-    # -------- core ----------
     def count(self) -> int:
         if self._embeddings is None:
             return 0
@@ -131,6 +138,7 @@ class FreeVectorDatabase:
             for line in lines:
                 f.write(line.rstrip("\n") + "\n")
 
+    # ---------- Public API ----------
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         return _embed_with_ollama(texts, self.ollama_embed_model, self.ollama_base_url)
 
@@ -143,10 +151,10 @@ class FreeVectorDatabase:
         if not chunks:
             raise ValueError("No chunks found in document content")
 
-        docs_lines = []
-        meta_lines = []
-        chunk_ids = []
-        texts = []
+        docs_lines: List[str] = []
+        meta_lines: List[str] = []
+        chunk_ids: List[str] = []
+        texts: List[str] = []
 
         for i, ch in enumerate(chunks):
             texts.append(ch['text'])
@@ -181,11 +189,7 @@ class FreeVectorDatabase:
             meta_lines.append(json.dumps(meta, ensure_ascii=False))
 
         # embed
-        try:
-            emb = np.asarray(self.generate_embeddings(texts), dtype=np.float32)  # (K, D)
-        except Exception as e:
-            logger.error(f"Embedding error: {e}")
-            raise
+        emb = np.asarray(self.generate_embeddings(texts), dtype=np.float32)  # (K, D)
 
         # append to memory + disk
         started_empty = (self._embeddings is None)
@@ -197,15 +201,11 @@ class FreeVectorDatabase:
             self._embeddings = np.vstack([self._embeddings, emb])
 
         # persist
-        try:
-            np.save(self.fp_emb, self._embeddings)
-            self._append_lines(self.fp_docs, docs_lines)
-            self._append_lines(self.fp_meta, meta_lines)
-            self._ids.extend(chunk_ids)
-            self.fp_ids.write_text(json.dumps(self._ids))
-        except Exception as e:
-            logger.error(f"Persistence error: {e}")
-            raise
+        np.save(self.fp_emb, self._embeddings)
+        self._append_lines(self.fp_docs, docs_lines)
+        self._append_lines(self.fp_meta, meta_lines)
+        self._ids.extend(chunk_ids)
+        self.fp_ids.write_text(json.dumps(self._ids), encoding="utf-8")
 
         # update hnsw if available & large
         try:
@@ -213,32 +213,7 @@ class FreeVectorDatabase:
         except Exception as e:
             logger.warning(f"HNSW update failed (non-fatal): {e}")
 
-        logger.info(f"Added document {document_id} with {len(chunks)} chunks (total={self.count()})")
         return document_id
-
-    # -------- HNSW handling ----------
-    def _maybe_load_hnsw(self):
-        if not HNSW_AVAILABLE:
-            return
-        if not (self.fp_hnsw.exists() and self.fp_hmeta.exists()):
-            return
-        try:
-            hmeta = json.loads(self.fp_hmeta.read_text())
-            dim = int(hmeta.get("dim", 0))
-            if dim <= 0:
-                return
-            index = hnswlib.Index(space="cosine", dim=dim)
-            index.load_index(str(self.fp_hnsw))
-            efS = int(hmeta.get("efS", 50))
-            index.set_ef(efS)
-            self._index = index
-            self._index_dim = dim
-            self._index_ready = True
-            logger.info(f"Loaded HNSW index (dim={dim}, efS={efS})")
-        except Exception as e:
-            logger.warning(f"Could not load HNSW index, will rebuild later: {e}")
-            self._index = None
-            self._index_ready = False
 
     def _maybe_update_hnsw(self, added: int, dim: int):
         if not HNSW_AVAILABLE:
@@ -249,52 +224,39 @@ class FreeVectorDatabase:
 
         if self._index is None or not self._index_ready or (self._index_dim and self._index_dim != dim):
             # build new index
-            index = hnswlib.Index(space="cosine", dim=dim)
+            index = hnswlib.Index(space="cosine", dim=dim)  # type: ignore
             index.init_index(max_elements=n, ef_construction=self.hnsw_efC, M=self.hnsw_M)
             index.add_items(self._embeddings, np.arange(n))
             index.set_ef(self.hnsw_efS)
             index.save_index(str(self.fp_hnsw))
-            self.fp_hmeta.write_text(json.dumps({"dim": dim, "efS": self.hnsw_efS, "M": self.hnsw_M, "efC": self.hnsw_efC}))
+            self.fp_hmeta.write_text(json.dumps({"dim": dim, "efS": self.hnsw_efS, "M": self.hnsw_M, "efC": self.hnsw_efC}), encoding="utf-8")
             self._index = index
             self._index_dim = dim
             self._index_ready = True
             logger.info(f"Built HNSW index for {n} items (M={self.hnsw_M}, efC={self.hnsw_efC})")
         else:
             # extend existing index
-            try:
-                current = self._index.get_current_count()
-                needed = self.count()
-                if needed > self._index.get_max_elements():
-                    self._index.resize_index(needed)
-                if added > 0:
-                    new_range = np.arange(current, current + added)
-                    self._index.add_items(self._embeddings[current:current+added], new_range)
-                    self._index.save_index(str(self.fp_hnsw))
-                    logger.info(f"Extended HNSW index by {added} items (total={needed})")
-            except Exception as e:
-                logger.warning(f"Extending HNSW index failed; will rebuild later: {e}")
-                self._index = None
-                self._index_ready = False
+            current = self._index.get_current_count()
+            needed = self.count()
+            if needed > self._index.get_max_elements():
+                self._index.resize_index(needed)
+            if added > 0:
+                new_range = np.arange(current, current + added)
+                self._index.add_items(self._embeddings[current:current+added], new_range)
+                self._index.save_index(str(self.fp_hnsw))
 
-    # -------- Query ----------
-    def search_similar(self, query: str, n_results: int = 5, filter_metadata: Dict[str, Any] = None) -> Dict[str, Any]:
-        total = self.count()
-        if total == 0:
-            return {"query": query, "total_results": 0, "results": []}
-
-        if n_results <= 0:
-            n_results = 1
-
+    def similarity_search(self, query: str, n_results: int = 8) -> List[Dict[str, Any]]:
+        if self._embeddings is None or self.count() == 0:
+            return []
         # embed query
-        try:
-            q_emb = np.asarray(self.generate_embeddings([query])[0], dtype=np.float32)
-        except Exception as e:
-            logger.error(f"Query embedding error: {e}")
-            return {"query": query, "total_results": 0, "results": []}
+        q_vec = self.generate_embeddings([query])[0]
+        q_emb = np.asarray(q_vec, dtype=np.float32)
 
-        # HNSW if available & ready
+        total = self.count()
         indices: List[int] = []
         scores: List[float] = []
+
+        # try HNSW
         if HNSW_AVAILABLE and self._index_ready and total >= self.hnsw_threshold:
             try:
                 I, D = self._index.knn_query(q_emb, k=min(n_results, total))
@@ -303,7 +265,7 @@ class FreeVectorDatabase:
             except Exception as e:
                 logger.warning(f"HNSW query failed, falling back to NumPy: {e}")
 
-        # Fallback to exact cosine
+        # Fallback exact cosine
         if not indices:
             sims = _cosine_sim(q_emb, self._embeddings)  # (N,)
             topk_idx = np.argpartition(-sims, min(n_results, len(sims)-1))[:n_results]
@@ -312,47 +274,29 @@ class FreeVectorDatabase:
             scores = [float(sims[i]) for i in indices]
 
         # read docs/meta
-        results = []
+        results: List[Dict[str, Any]] = []
         needed = set(indices)
         docs_by_i: Dict[int, str] = {}
         metas_by_i: Dict[int, Dict[str, Any]] = {}
 
-        try:
-            with self.fp_docs.open("r", encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    if i in needed:
-                        docs_by_i[i] = json.loads(line)
-        except Exception as e:
-            logger.error(f"Reading docs failed: {e}")
-            return {"query": query, "total_results": 0, "results": []}
+        with self.fp_docs.open("r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i in needed:
+                    docs_by_i[i] = json.loads(line)
+        with self.fp_meta.open("r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i in needed:
+                    metas_by_i[i] = json.loads(line)
 
-        try:
-            with self.fp_meta.open("r", encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    if i in needed:
-                        metas_by_i[i] = json.loads(line)
-        except Exception as e:
-            logger.error(f"Reading meta failed: {e}")
-            return {"query": query, "total_results": 0, "results": []}
-
-        for idx, sc in zip(indices, scores):
-            meta = metas_by_i.get(idx, {})
-            if filter_metadata:
-                ok = True
-                for k, v in filter_metadata.items():
-                    if str(meta.get(k)) != str(v):
-                        ok = False
-                        break
-                if not ok:
-                    continue
+        for rank, idx in enumerate(indices):
+            doc = docs_by_i.get(idx, "")
+            md = metas_by_i.get(idx, {})
             results.append({
-                "document": docs_by_i.get(idx, ""),
-                "metadata": meta,
-                "similarity_score": float(sc),
-                "chunk_id": self._ids[idx] if idx < len(self._ids) else None
+                "score": float(scores[rank]) if rank < len(scores) else None,
+                "text": doc,
+                "metadata": md
             })
-
-        return {"query": query, "total_results": len(results), "results": results}
+        return results
 
     # -------- Stats & maintenance ----------
     def get_database_stats(self) -> Dict[str, Any]:
@@ -365,56 +309,123 @@ class FreeVectorDatabase:
             "hnsw_enabled": bool(self._index_ready),
             "hnsw_threshold": self.hnsw_threshold
         }
+        # sample file types from meta
+        file_types: Dict[str, int] = {}
         if self.fp_meta.exists():
             try:
                 with self.fp_meta.open("r", encoding="utf-8") as f:
-                    for _ in range(10):
+                    for _ in range(1000):  # scan up to first 1000 lines for stats
                         line = f.readline()
                         if not line:
                             break
                         md = json.loads(line)
-                        info.setdefault("file_types", {})
                         ft = md.get("file_type", "unknown")
-                        info["file_types"][ft] = info["file_types"].get(ft, 0) + 1
+                        file_types[ft] = file_types.get(ft, 0) + 1
             except Exception:
                 pass
+        if file_types:
+            info["file_types"] = file_types
         return info
 
     def delete_document(self, document_id: str) -> bool:
-        logger.warning("Selective delete not supported in simple store. Use reset_database().")
-        return False
-
-    def reset_database(self) -> bool:
-        try:
-            for p in [self.fp_emb, self.fp_docs, self.fp_meta, self.fp_ids, self.fp_hnsw, self.fp_hmeta]:
-                if p.exists():
-                    p.unlink()
-            self._embeddings = None
-            self._ids = []
-            self._index = None
-            self._index_ready = False
-            logger.info("Local vector store reset.")
-            return True
-        except Exception as e:
-            logger.error(f"Reset error: {e}")
+        """
+        Delete all chunks (rows) associated with a given document_id.
+        Returns True if anything was deleted, False otherwise.
+        """
+        if not (self.fp_docs.exists() and self.fp_meta.exists() and self.fp_emb.exists()):
+            return False
+        # Identify indices to keep / drop
+        keep_indices: List[int] = []
+        drop_indices: List[int] = []
+        metas: List[Dict[str, Any]] = []
+        with self.fp_meta.open("r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                md = json.loads(line)
+                metas.append(md)
+                if str(md.get("document_id")) == str(document_id):
+                    drop_indices.append(i)
+                else:
+                    keep_indices.append(i)
+        if not drop_indices:
             return False
 
-    def export_metadata(self, output_file: str = None) -> Dict[str, Any]:
+        # Rebuild embeddings & ids
+        emb = np.load(self.fp_emb)
+        keep_mask = np.ones(emb.shape[0], dtype=bool)
+        keep_mask[drop_indices] = False
+        new_emb = emb[keep_mask]
+        np.save(self.fp_emb, new_emb)
+        self._embeddings = new_emb
+
+        # Rebuild docs.jsonl and meta.jsonl
+        new_docs_lines: List[str] = []
+        new_meta_lines: List[str] = []
+        with self.fp_docs.open("r", encoding="utf-8") as f_docs, self.fp_meta.open("r", encoding="utf-8") as f_meta:
+            for i, (dline, mline) in enumerate(zip(f_docs, f_meta)):
+                if i in keep_indices:
+                    new_docs_lines.append(dline.rstrip("\n"))
+                    new_meta_lines.append(mline.rstrip("\n"))
+        self.fp_docs.write_text("\n".join(new_docs_lines) + ("\n" if new_docs_lines else ""), encoding="utf-8")
+        self.fp_meta.write_text("\n".join(new_meta_lines) + ("\n" if new_meta_lines else ""), encoding="utf-8")
+
+        # Rebuild ids
+        new_ids: List[str] = []
+        for i, old_id in enumerate(self._ids):
+            # old ids were document_id_chunk_k; recompute only for kept rows
+            # We cannot know positions here reliably, regenerate sequentially:
+            new_ids.append(old_id)  # keep original ids for stability
+        # But also drop ids for removed indices:
+        new_ids = [id_ for i, id_ in enumerate(self._ids) if i in keep_indices]
+        self._ids = new_ids
+        self.fp_ids.write_text(json.dumps(self._ids), encoding="utf-8")
+
+        # Remove/refresh HNSW
+        if HNSW_AVAILABLE and self.fp_hnsw.exists():
+            try:
+                self.fp_hnsw.unlink(missing_ok=True)
+                self.fp_hmeta.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._index = None
+            self._index_ready = False
+            self._index_dim = None
+            # Rebuild index only if above threshold
+            if self.count() >= self.hnsw_threshold:
+                self._maybe_update_hnsw(added=0, dim=self._embeddings.shape[1])
+
+        logger.info(f"Deleted document_id={document_id} with {len(drop_indices)} chunks.")
+        return True
+
+    def reset_database(self) -> None:
+        """Delete all data in this collection."""
+        for fp in [self.fp_emb, self.fp_docs, self.fp_meta, self.fp_ids, self.fp_hnsw, self.fp_hmeta]:
+            try:
+                fp.unlink(missing_ok=True)
+            except Exception:
+                pass
+        self._embeddings = None
+        self._ids = []
+        self._index = None
+        self._index_ready = False
+        self._index_dim = None
+        logger.warning("Vector database reset completed.")
+
+    # ---------- Export ----------
+    def export_metadata(self, output_file: Optional[str] = None) -> Dict[str, Any]:
+        chunks: List[Dict[str, Any]] = []
         try:
-            chunks = []
-            if self.fp_meta.exists() and self.fp_docs.exists():
-                with self.fp_meta.open("r", encoding="utf-8") as fm, self.fp_docs.open("r", encoding="utf-8") as fd:
-                    for i, (ml, dl) in enumerate(zip(fm, fd)):
-                        md = json.loads(ml)
-                        doc = json.loads(dl)
-                        chunks.append({
-                            "id": self._ids[i] if i < len(self._ids) else f"row_{i}",
-                            "metadata": md,
-                            "document_preview": (doc[:200] + "...") if isinstance(doc, str) and len(doc) > 200 else doc
-                        })
+            with self.fp_docs.open("r", encoding="utf-8") as f_docs, self.fp_meta.open("r", encoding="utf-8") as f_meta:
+                for dline, mline in zip(f_docs, f_meta):
+                    doc = json.loads(dline)
+                    md = json.loads(mline)
+                    chunks.append({
+                        "text": doc,
+                        "metadata": md,
+                        "document_preview": (doc[:200] + "...") if isinstance(doc, str) and len(doc) > 200 else doc
+                    })
             export = {
-                "export_timestamp": datetime.now().isoformat(),
                 "collection_name": self.collection_name,
+                "database_path": str(self.root),
                 "total_chunks": len(chunks),
                 "chunks": chunks
             }
@@ -423,5 +434,5 @@ class FreeVectorDatabase:
                 logger.info(f"Exported metadata to {output_file}")
             return export
         except Exception as e:
-            logger.error(f"Export error: {e}")
-            return {"error": str(e)}
+            logger.error(f"Export failed: {e}")
+            raise
